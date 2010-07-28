@@ -143,9 +143,9 @@ headers(#c{sock = Sock, socket_mode = SocketMode, recv_timeout = RecvTimeout, ws
 				false ->
 					?LOG_DEBUG("normal http request received", []),
 					body(C, Req#req{headers = Headers});
-				{true, Origin, Host, Path} ->
+				{true, Origin, Host, Path, SecurityKeys} ->
 					?LOG_DEBUG("websocket request received", []),
-					misultin_websocket:connect(#ws{socket = Sock, socket_mode = SocketMode, peer_addr = Req#req.peer_addr, peer_port = Req#req.peer_port, origin = Origin, host = Host, path = Path}, WsLoop)
+					misultin_websocket:connect(#ws{socket = Sock, socket_mode = SocketMode, peer_addr = Req#req.peer_addr, peer_port = Req#req.peer_port, origin = Origin, host = Host, path = Path}, SecurityKeys, WsLoop)
 			end;
 		{SocketMode, Sock, _Other} ->
 			?LOG_DEBUG("tcp error treating headers: ~p, send bad request error back", [_Other]),

@@ -34,11 +34,23 @@
 -vsn("0.6.0").
 
 % API
--export([check/2, connect/2]).
+-export([check/2, connect/3]).
+-export([crunch_ws_key/1, crunch_ws_key_parts/2]).
 
 
 % includes
 -include("../include/misultin.hrl").
+
+
+% records
+-record(ws_handshake, {
+  upgrade=no,
+  connection=no,
+  host=no,
+  origin=no,
+  key1=no,
+  key2=no
+}).
 
 
 % ============================ \/ API ======================================================================
@@ -47,41 +59,123 @@
 % Description: Check if the incoming request is a websocket handshake.
 check(Path, Headers) ->
 	?LOG_DEBUG("testing for a websocket request, path: ~p headers: ~p", [Path, Headers]),
-	case Headers of
-		[{'Upgrade', "WebSocket"}, {'Connection', "Upgrade"}, {'Host', Host}, {"Origin", Origin}|_RH] ->
-			% websockets request
-			{true, Origin, Host, Path};
+	case check_ws_headers(Headers) of
+    {ok,Host,Origin} ->
+			% websockets request WITHOUT Sec-Websocket-Key(1|2).  Dangerous to accept.
+			{true, Origin, Host, Path, []};
+    {ok,Host,Origin,Key1,Key2} ->
+      % websockets request WITH Sec-Websocket-Key(1|2).  See http://www.whatwg.org/specs/web-socket-protocol/
+      SecurityKeys={Key1,Key2},
+      {true, Origin, Host, Path, SecurityKeys};
 		_Else ->
 			% normal HTTP request
 			false
 	end.
 
 % Connect and handshake with Websocket.
-connect(#ws{socket = Socket, socket_mode = SocketMode, origin = Origin, host = Host, path = Path} = Ws, WsLoop) ->
+connect(#ws{socket = Socket, socket_mode = SocketMode, origin = Origin, host = Host, path = Path} = Ws, SecurityKeys, WsLoop) ->
 	?LOG_DEBUG("received websocket handshake request", []),
 	HandshakeServer = ["HTTP/1.1 101 Web Socket Protocol Handshake\r\n",
 		"Upgrade: WebSocket\r\n",
 		"Connection: Upgrade\r\n",
-		"WebSocket-Origin: ", Origin , "\r\n",
-		"WebSocket-Location: ws://", lists:concat([Host, Path]), "\r\n\r\n"
+		"Sec-WebSocket-Origin: ", Origin , "\r\n",
+		"Sec-WebSocket-Location: ws://", lists:concat([Host, Path]), "\r\n\r\n"
 	],
 	% send handshake back
 	misultin_socket:send(Socket, HandshakeServer, SocketMode),
-	% spawn controlling process
-	Ws0 = misultin_ws:new(Ws, self()),
-	WsHandleLoopPid = spawn(fun() -> WsLoop(Ws0) end),
-	erlang:monitor(process, WsHandleLoopPid),
-	% set opts
-	misultin_socket:setopts(Socket, [{packet, 0}, {active, true}], SocketMode),
-	% add main websocket pid to misultin server reference
-	misultin:persistent_socket_pid_add(self()),
-	% start listening for incoming data
-	ws_loop(Socket, none, WsHandleLoopPid, SocketMode).	
+  % set opts for reading security header and subsequent data
+  misultin_socket:setopts(Socket, [{packet, 0}, {active, true}], SocketMode),
+  % listen for final security piece of handshake
+  Success = case SecurityKeys of
+    {Key1, Key2} ->
+      receive
+        {tcp, _Socket, Data} when size(Data) == 8 ->
+          CKey1 = crunch_ws_key(Key1),
+          CKey2 = crunch_ws_key(Key2),
+          Md5Source = <<CKey1:32, CKey2:32, Data/binary>>,
+          Md5 = erlang:md5(Md5Source),
+          ?LOG_DEBUG("CKey1/CKey2/Data/Secure Response: ~p/~p/~p/~p", [CKey1, CKey2, Data, Md5]),
+          misultin_socket:send(Socket, Md5, SocketMode),
+          true
+        after 5000 ->
+          ?LOG_DEBUG("Valid security data NOT received - expected 8 bytes", [ ]),
+          misultin_socket:close(Socket),
+          false
+      end;
+    _ ->
+      true
+  end,
+  case Success of
+    false -> ok;
+    true ->
+      % set opts for reading data
+      misultin_socket:setopts(Socket, [{packet, 0}, {active, true}], SocketMode),
+      % add main websocket pid to misultin server reference
+      misultin:persistent_socket_pid_add(self()),
+      % initialize the sending interface
+      Ws0 = misultin_ws:new(Ws, self()),
+      % spawn controlling process
+      WsHandleLoopPid = spawn(fun() -> WsLoop(Ws0) end),
+      erlang:monitor(process, WsHandleLoopPid),
+      % start listening for incoming data
+      ws_loop(Socket, none, WsHandleLoopPid, SocketMode)
+  end.
 	
 % ============================ /\ API ======================================================================
 
 
 % ============================ \/ INTERNAL FUNCTIONS =======================================================
+  
+% Checks for non-normative header ordering ... As per specs from
+% http://www.whatwg.org/specs/web-socket-protocol/
+% : "Fields in the handshake are sent by the client in a random order; the
+%    order is not meaningful."
+% Find [{'Upgrade', "WebSocket"}, {'Connection', "Upgrade"}, {'Host', Host}, {"Origin", Origin}|_RH]
+check_ws_headers(Headers) ->
+  case check_ws_headers_util(#ws_handshake{}, Headers) of
+    #ws_handshake{upgrade=ok, connection=ok, host=Host, origin=Origin, key1=no, key2=no} when Host =/= no, Origin =/= no -> {ok,Host,Origin};
+    #ws_handshake{upgrade=ok, connection=ok, host=Host, origin=Origin, key1=Key1, key2=Key2} 
+      when Host =/= no, Origin =/= no, Key1 =/= no, Key2 =/= no -> 
+      {ok,Host,Origin,Key1,Key2};
+    _ -> {error,missing_headers}
+  end.
+    
+check_ws_headers_util(Result=#ws_handshake{}, []) ->
+  Result;
+check_ws_headers_util(Result=#ws_handshake{upgrade=no}, [{'Upgrade', "WebSocket"}|T]) ->
+  check_ws_headers_util(Result#ws_handshake{upgrade=ok}, T);
+check_ws_headers_util(Result=#ws_handshake{connection=no}, [{'Connection',"Upgrade"}|T]) ->
+  check_ws_headers_util(Result#ws_handshake{connection=ok}, T);
+check_ws_headers_util(Result=#ws_handshake{host=no}, [{'Host', Host}|T]) ->
+  check_ws_headers_util(Result#ws_handshake{host=Host}, T);
+check_ws_headers_util(Result=#ws_handshake{origin=no}, [{"Origin", Origin}|T]) ->
+  check_ws_headers_util(Result#ws_handshake{origin=Origin}, T);
+check_ws_headers_util(Result=#ws_handshake{key1=no}, [{"Sec-WebSocket-Key1", Key1}|T]) ->
+  check_ws_headers_util(Result#ws_handshake{key1=Key1}, T);
+check_ws_headers_util(Result=#ws_handshake{key2=no}, [{"Sec-WebSocket-Key2", Key2}|T]) ->
+  check_ws_headers_util(Result#ws_handshake{key2=Key2}, T);
+% --Firefox has an uncapitalized s... Reported as bug https://bugzilla.mozilla.org/show_bug.cgi?id=582408--
+check_ws_headers_util(Result=#ws_handshake{key1=no}, [{"Sec-Websocket-Key1", Key1}|T]) ->
+  check_ws_headers_util(Result#ws_handshake{key1=Key1}, T);
+check_ws_headers_util(Result=#ws_handshake{key2=no}, [{"Sec-Websocket-Key2", Key2}|T]) ->
+  check_ws_headers_util(Result#ws_handshake{key2=Key2}, T);
+% --End Firefox hacks...--
+check_ws_headers_util(Result, [_|T]) ->
+  check_ws_headers_util(Result, T).
+  
+% Parses a key header field as per the opening handshake for websockets
+crunch_ws_key(Key) ->
+  {Number,Spaces} = crunch_ws_key_parts({0,0}, Key),
+  Number div Spaces.
+  
+crunch_ws_key_parts(Result={_Number, _Spaces}, []) ->
+  Result;
+crunch_ws_key_parts({Number,Spaces}, [H|T]) when $0 =< H, $9 >= H ->
+  crunch_ws_key_parts({Number * 10 + (H - $0), Spaces}, T);
+crunch_ws_key_parts({Number,Spaces}, [$ |T]) ->
+  crunch_ws_key_parts({Number, Spaces + 1}, T);
+crunch_ws_key_parts(Result, [_|T]) ->
+  crunch_ws_key_parts(Result, T).
 
 % Main Websocket loop
 ws_loop(Socket, Buffer, WsHandleLoopPid, SocketMode) ->
@@ -117,6 +211,8 @@ ws_loop(Socket, Buffer, WsHandleLoopPid, SocketMode) ->
 	end.
 
 % Buffering and data handling
+handle_data(none, [255,0], _Socket, _WsHandleLoopPid, _SocketMode) ->
+  self() ! shutdown;
 handle_data(none, [0|T], Socket, WsHandleLoopPid, SocketMode) ->
 	handle_data([], T, Socket, WsHandleLoopPid, SocketMode);
 handle_data(none, [], Socket, WsHandleLoopPid, SocketMode) ->
